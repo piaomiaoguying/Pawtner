@@ -66,6 +66,10 @@ STATE_MAP: dict[str, str] = {
 # Debounce：从 working 切到 standby 的最小间隔（秒）
 DEBOUNCE_WORKING = 3.0
 
+# StopFailure 冷却：同一 session 连续 StopFailure 最小间隔（秒）
+# 防止 API 故障时的事件风暴反复覆盖用户恢复操作
+STOPFAILURE_DEBOUNCE = 5.0
+
 PROJECT_DIR = Path(__file__).resolve().parent
 
 # 日志配置
@@ -154,43 +158,6 @@ def _cleanup_expired(now: float):
         pass
 
 
-def _is_pid_alive(pid: int) -> bool:
-    """进程是否存活。信号 0 不实际发信号，只做存在性检查。"""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True   # 进程存在但无权限信号
-    except OSError:
-        return False
-    return True
-
-
-def _cleanup_dead_owners():
-    """删除 owner Claude 进程已死的实例文件。
-
-    Ctrl+C 强退 Claude 不触发 SessionEnd，error/need_user 等闪烁锁状态
-    会成为孤儿。这里靠实例文件里的 claude_pid 判断 owner 是否还活着，
-    死了就删——配合下面闪烁锁的"锁主已死放行"分支实现自愈。
-    """
-    try:
-        for path in INSTANCES_DIR.iterdir():
-            if not path.suffix == ".json":
-                continue
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                continue
-            pid = data.get("claude_pid")
-            if not pid:
-                continue
-            if not _is_pid_alive(int(pid)):
-                path.unlink(missing_ok=True)
-    except FileNotFoundError:
-        pass
-
-
 def _write_instance(session_id: str, status: str, priority: int, project: str):
     """原子写入实例文件：先写临时文件，再 rename。
 
@@ -201,8 +168,8 @@ def _write_instance(session_id: str, status: str, priority: int, project: str):
     """
     target = INSTANCES_DIR / f"{session_id}.json"
     tmp = INSTANCES_DIR / f".{session_id}.{os.getpid()}.{time.monotonic_ns()}.tmp"
-    # 记录 owner Claude 进程的 PID（hook 的父进程），用于自愈清理：
-    # Ctrl+C 强退 Claude 不触发 SessionEnd，靠 PID 存活检测回收孤儿实例。
+    # claude_pid 仅作调试元数据写入，不参与任何灯光逻辑决策。
+    # 闪烁锁基于实例文件内容（status 是否为 BLINK_STATE）而非 PID 判断。
     content = json.dumps({
         "session_id": session_id,
         "project": project,
@@ -385,8 +352,8 @@ def main():
     # 必须在 flock 之前写：PreToolUse 和 PermissionRequest 可能并发，
     # 抢锁输的一方也不能丢状态——实例文件已落盘，下一次聚合就能读到。
     if event == "SessionEnd":
-        # SessionEnd 必须在 flock 内处理：如果先删了文件，中间别的
-        # hook 聚合就会误以为无实例，关掉宠物。
+        # SessionEnd 在 flock 内通过 _delete_instance 清理自身实例，
+        # 不在此处写入（避免先写 off 又被其他并发 hook 覆盖的竞态）。
         pass
     else:
         _write_instance(session_id, status, priority, project)
@@ -419,17 +386,29 @@ def main():
 
         # 0) 清理过期（在聚合之前，确保不会读到过期数据）
         _cleanup_expired(now)
-        # 0.5) 回收 owner 已死的孤儿实例（Ctrl+C 强退自愈）
-        _cleanup_dead_owners()
 
-        # 1) 聚合（本实例文件已在 flock 前写入，直接聚合即可）
+        # 0.5) StopFailure 去重：同一 session 连续 StopFailure 冷却
+        # 防止 API 故障风暴反复覆盖用户恢复后的工作状态。
+        # 只抑制同一 session 的重复 StopFailure，真正的新错误仍会触发。
+        if event == "StopFailure":
+            prev_state = _read_current_state()
+            if prev_state and prev_state.get("status") == "error":
+                owner = prev_state.get("owner_session_id", "")
+                last_error = prev_state.get("updated_at", 0)
+                if owner == session_id and now - last_error < STOPFAILURE_DEBOUNCE:
+                    _log(session_id, event, status, "debounce:skip_consecutive_error")
+                    raise SystemExit(0)
+
+        # 0.6) SessionEnd：删除本实例，让聚合仅反映其他活跃 session
+        if event == "SessionEnd":
+            _delete_instance(session_id)
+
+        # 1) 聚合
         best_status, best_priority, aggregated_session_id = _aggregate()
 
         # 1.1) 竞态修复：pre-flock 写可能被并发 hook 覆盖。
-        # （PreToolUse working 覆盖了 PermissionRequest need_user）。
-        # 若聚合结果不是本事件的 status，说明本事件的写入被覆盖了——
-        # 重新写入并再次聚合，确保本事件的状态落盘。
-        if best_status != status:
+        # SessionEnd 已主动删实例，不参与竞态修复。
+        if event != "SessionEnd" and best_status != status:
             _write_instance(session_id, status, priority, project)
             best_status, best_priority, aggregated_session_id = _aggregate()
 
@@ -450,13 +429,25 @@ def main():
                 best_priority = prev_priority
                 aggregated_session_id = prev_session_id
 
-        # 2.6) 闪烁锁：闪烁状态一旦确立，只能被同一实例、更高优先级闪烁、或已死实例覆盖
+        # 2.6) 闪烁锁：闪烁状态一旦确立，只能被同一实例、更高优先级闪烁、或锁主已退出的情况覆盖
+        # 锁主是否"存活"不由 PID 判断，而是检查其实例文件的 status：
+        #   - 实例文件仍为 BLINK_STATE → 锁主还在闪烁状态 → 保护
+        #   - 实例文件非 BLINK_STATE（如 off/working）→ 锁主已退出 → 放行
+        #   - 实例文件不存在 → 放行
         prev = _read_current_state()
         if prev and prev.get("status") in BLINK_STATES:
             owner_id = prev.get("owner_session_id", "")
             owner_file = INSTANCES_DIR / f"{owner_id}.json"
+            # 读锁主实例的内容状态，判断锁是否真的还在
+            owner_still_blinking = False
             if owner_file.exists():
-                # 锁主还活着 → 只有同一实例或更高优先级闪烁才能覆盖
+                try:
+                    owner_data = json.loads(owner_file.read_text(encoding="utf-8"))
+                    owner_still_blinking = owner_data.get("status", "") in BLINK_STATES
+                except (json.JSONDecodeError, OSError):
+                    pass  # 文件损坏 → 视为锁主已退出
+            if owner_still_blinking:
+                # 锁主还在闪烁 → 只有同一实例或更高优先级闪烁才能覆盖
                 if aggregated_session_id == owner_id:
                     pass  # 放行：同一实例
                 elif aggregated_session_id != "" and best_status in BLINK_STATES and best_priority < prev.get("priority", sys.maxsize):
@@ -466,7 +457,18 @@ def main():
                     best_status = prev["status"]
                     best_priority = prev["priority"]
                     aggregated_session_id = owner_id  # 保持原所有者不变
-            # else: 锁主已死（SessionEnd 或 _cleanup_dead_owners 删了文件）→ 放行
+            # else: 锁主已退出闪烁状态（正常结束 / SessionEnd 写了 off）→ 放行
+
+        # 2.7) 用户主动输入 → 无条件覆盖任何闪烁锁
+        # UserPromptSubmit 是"人在用"的明确信号：无论之前的 error/need_user
+        # 是哪个 session 触发的、锁主是否还在，用户正在操作就应该反映工作状态。
+        # 系统事件（PreToolUse/StopFailure）不应自动覆盖异常，
+        # 但人的明确输入行为例外。
+        if event == "UserPromptSubmit" and best_status != status:
+            _log(session_id, event, status, f"user-override:{prev.get('status','?')}→{status}")
+            best_status = status
+            best_priority = priority
+            aggregated_session_id = session_id
 
         # 3) Debounce: 本实例刚切到 standby，但之前是 working → 保持 working
         if best_status == "standby":
