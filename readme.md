@@ -63,7 +63,8 @@ Claude Code 的每个生命周期事件触发一个 hook，hook 写入实例状�
 
 **聚合规则**（多实例多会话并发）：
 - **后触发者胜** — 取 `updated_at` 最新的实例状态（不做优先级聚合）
-- **闪烁锁** — `need_user` / `error` 一旦确立，只有同实例或更高优先级闪烁能覆盖
+- **闪烁锁** — `need_user` / `error` 保护中，仅同一实例、更高优先级闪烁、或用户主动输入（UserPromptSubmit）可覆盖
+- **StopFailure 去重** — 同一 session 连续 StopFailure 至少间隔 5 秒，防止故障风暴反复切换
 - **TTL 过期** — `working` 15s、`standby` 120s、`waiting_user` 300s 后自动清理
 - **Debounce** — `working` → `standby` 至少间隔 3 秒，防止瞬间抖动
 - **SessionStart 抑制** — 已有其他会话活跃时，新会话不切 `standby`
@@ -83,7 +84,8 @@ pet_hook.py  ← 纯 hook 驱动，无常驻进程
     │
     ├─ SessionStart → 清除禁用哨兵
     ├─ 多实例聚合引擎 → 后触发者胜
-    ├─ 闪烁锁 → need_user/error 不受低优先级干扰
+    ├─ 闪烁锁 → need_user/error 保护中，仅同一实例、更高优先级闪烁、或用户主动输入可覆盖
+    ├─ StopFailure 去重 → 同一 session 连续 StopFailure 5 秒冷却，防止故障风暴反复切换
     ├─ flock 全局锁 → 防并发冲突
     └─ pet_window.py (子进程) → GIF 动画桌面宠物
 ```
