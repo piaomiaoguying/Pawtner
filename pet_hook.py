@@ -36,6 +36,8 @@ INSTANCES_DIR = STATE_DIR / "instances"
 LOCK_FILE = STATE_DIR / "lock"
 CURRENT_STATE_FILE = STATE_DIR / "current_state"
 DISABLED_FILE = STATE_DIR / "disabled"
+# 持久停用标记（由 pet_ctl.py stop 写入，SessionStart 不会清除）
+STOPPED_FILE = STATE_DIR / "stopped"
 
 PET_STATE_FILE = STATE_DIR / "pet_state.json"
 PET_PID_FILE = STATE_DIR / "pet.pid"
@@ -341,7 +343,8 @@ def main():
         DISABLED_FILE.unlink(missing_ok=True)
 
     # 哨兵文件存在 → 已禁用，直接退出
-    if DISABLED_FILE.exists():
+    # stopped 是 pet_ctl.py stop 写的持久标记，SessionStart 不清除
+    if DISABLED_FILE.exists() or STOPPED_FILE.exists():
         _log(session_id, event, status, "disabled")
         sys.exit(0)
     project = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())

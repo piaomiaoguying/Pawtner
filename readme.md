@@ -95,11 +95,27 @@ pet_hook.py  ← 纯 hook 驱动，无常驻进程
 ## 🛠️ 命令
 
 ```bash
-./install.sh                          # 一键安装
-./toggle_pet.sh             # 开关宠物（自动检测运行状态）
-./toggle_pet.sh off         # 关掉宠物
-.venv/bin/python pet_window.py --test  # 测试所有状态动画
+./install.sh                            # 一键安装
+./toggle_pet.sh                         # 开关宠物（自动检测运行状态）
+./toggle_pet.sh off                     # 本会话内关掉宠物（新会话会复活）
+.venv/bin/python pet_window.py --test   # 测试所有状态动画
 ```
+
+### 进程管理与卸载
+
+`pet_ctl.py` 用于「彻底关掉」和「干净卸载」——两者都跨会话生效。
+
+```bash
+.venv/bin/python pet_ctl.py status                # 进程 / 抑制标记 / hook 安装状态
+.venv/bin/python pet_ctl.py stop                  # 结束进程 + 持久抑制，新会话也不复活
+.venv/bin/python pet_ctl.py start                 # 解除抑制，宠物恢复
+.venv/bin/python pet_ctl.py uninstall --dry-run   # 预览：将删哪些 pet hook、保留哪些
+.venv/bin/python pet_ctl.py uninstall             # 只删 pet hook，其他 hook 原样保留
+```
+
+- **与 `toggle_pet.sh off` 的区别**：后者只写会话级哨兵，`SessionStart` 会清除它；`stop` 额外写 `~/.claude/state/pet/stopped`（持久标记），hook 遇到它直接退出且 `SessionStart` 不清除。
+- **卸载不影响其他 hook**：只移除 `command` 中含 `pet-hook` 的条目；同 group 的 `promlight-hook.sh`、`dingtalk-notify.py` 等原样保留，`env`/`permissions`/`statusLine` 等其他配置不动。写入前自动备份为 `settings.json.bak-<时间戳>`。
+- **卸载范围**：删除 `~/.claude/scripts/pet-hook` 符号链接、`~/.claude/state/pet` 状态目录，并结束残留宠物进程。加 `--keep-state` 可保留状态目录。
 
 ## 📜 许可
 

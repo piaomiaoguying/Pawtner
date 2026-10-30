@@ -17,6 +17,7 @@ set -e
 # =============================================
 
 SENTINEL="$HOME/.claude/state/pet/disabled"
+STOPPED="$HOME/.claude/state/pet/stopped"
 NO_LOG="$HOME/.claude/state/pet/no-log"
 
 enable_hook() {
@@ -99,9 +100,11 @@ case "$CMD" in
         disable_hook
         ;;
     status)
-        if [ -f "$SENTINEL" ]; then
-            echo "状态: 🔴 已禁用 (哨兵文件存在)"
-            echo "       SessionStart 会自动检测连接状态，如宠物进程运行会重新启用"
+        if [ -f "$STOPPED" ]; then
+            echo "状态: 🔴 已持久停用 (pet_ctl.py stop 写入的 stopped 标记)"
+            echo "       新开会话也不会复活，恢复用: .venv/bin/python pet_ctl.py start"
+        elif [ -f "$SENTINEL" ]; then
+            echo "状态: 🟡 本会话已禁用 (SessionStart 会清除 disabled 标记并重新启用)"
         else
             echo "状态: 🟢 已启用 (hook 正常执行)"
         fi
